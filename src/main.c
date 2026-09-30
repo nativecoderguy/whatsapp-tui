@@ -31,15 +31,18 @@
 #define PASTE_END (KEY_MAX+2)
 enum { BASE=1, PANEL, MUTED, ACCENT, SELECTED, OUTGOING, ERROR_STYLE, QR_STYLE, QR_INVERSE, PANEL_MUTED, PANEL_ACCENT, SELECTED_MUTED };
 enum { CHAT_FOCUS, COMPOSE_FOCUS, SEARCH_FOCUS, NEW_FOCUS };
+typedef struct { char id[160]; int start,end; } Mention;
 typedef struct {
     char id[160], name[256], preview[512];
     long time;
     int unread;
     wchar_t draft[EDIT_SIZE];
     char attachment[PATH_MAX];
+    char quote_id[160], quote_sender[256], quote_text[512];
+    Mention mentions[32]; int mention_count;
 } Chat;
 typedef struct {
-    char id[160], jid[160], sender[256], status[32];
+    char id[160], jid[160], sender[256], status[32], quote_sender[256], quote_text[512];
     char *text;
     long time;
     bool mine;
@@ -96,6 +99,24 @@ static void close_photo(void);
 static void next_photo(int delta);
 static void discard_photo(Chat *chat);
 static void history_request(void);
+static void edit_key(wchar_t *buf,int capacity,int *cursor,wint_t key,bool special);
+typedef struct { char id[160],name[256]; } Member;
+static Member members[2048];
+static int member_count;
+static char member_jid[160],member_error[256];
+static bool member_pending;
+static int picker, picker_choice, picker_count, picker_top;
+static int picker_items[MAX_MESSAGES],picker_scores[MAX_MESSAGES],picker_cursor;
+static wchar_t picker_query[128];
+static void picker_filter(void);
+static int fuzzy_score(const char *text,const wchar_t *needle);
+static void search_history(void);
+static Message search_results[200];static int search_count;
+static unsigned search_request;
+static bool search_pending;
+static char jump_id[160];
+static void compose_edit(wint_t key,bool special);
+
 
 static void copy(char *dst, size_t size, const char *src) { snprintf(dst,size,"%s",src?src:""); }
 static bool join_path(char *dst,size_t size,const char *base,const char *suffix) {
@@ -195,15 +216,17 @@ static Chat *find_chat(const char *id,bool create) {
     Chat *c=&chats[chat_count++]; copy(c->id,sizeof c->id,id); copy(c->name,sizeof c->name,id); return c;
 }
 static bool matches(const char *name) {
-    wchar_t hay[512]; mbstate_t st={0}; const char *s=name;
-    size_t n=mbsrtowcs(hay,&s,511,&st); if(n==(size_t)-1) return false;
-    hay[n]=0; for(size_t i=0;i<n;i++) hay[i]=towlower(hay[i]);
-    wchar_t needle[128]; wcscpy(needle,query);
-    for(size_t i=0;needle[i];i++) needle[i]=towlower(needle[i]);
-    return wcsstr(hay,needle)!=NULL;
+    return fuzzy_score(name,query)!=INT_MIN;
 }
 static int chat_compare(const void *a,const void *b) {
     const Chat *ca=&chats[*(const int*)a],*cb=&chats[*(const int*)b];
+    if(*query) {
+        int sa=fuzzy_score(ca->name,query),sb=fuzzy_score(cb->name,query);
+        int ia=fuzzy_score(ca->id,query),ib=fuzzy_score(cb->id,query);
+        if(ia>sa)sa=ia;
+        if(ib>sb)sb=ib;
+        if(sa!=sb)return sa>sb?-1:1;
+    }
     if(ca->time!=cb->time) return ca->time<cb->time?1:-1;
     return strcmp(ca->name,cb->name);
 }
@@ -226,6 +249,7 @@ static bool command(json_object *o) {
     free(line); return true;
 }
 static void history_request(void) {
+    jump_id[0]=0;
     if(selected<0) return;
     scroll_offset=0; compose_cursor=(int)wcslen(chats[selected].draft);
     if(demo) return;
@@ -252,6 +276,8 @@ static void add_message(json_object *o) {
     free(m->text); m->text=body;
     copy(m->id,sizeof m->id,id); copy(m->jid,sizeof m->jid,jid);
     copy(m->sender,sizeof m->sender,str(o,"sender")); copy(m->status,sizeof m->status,str(o,"status"));
+    copy(m->quote_sender,sizeof m->quote_sender,str(o,"quoteSender"));
+    copy(m->quote_text,sizeof m->quote_text,str(o,"quoteText"));
     m->mine=num(o,"mine")!=0; m->time=num(o,"time");
     m->photo=num(o,"photo")!=0 || !strncmp(m->text,"[Photo",6);
 }
@@ -268,6 +294,35 @@ static void event(json_object *o) {
             break;
         }
         return;
+    }
+    if(!strcmp(type,"search-results") || (!strcmp(type,"error")&&!strcmp(str(o,"scope"),"search"))) {
+        if(picker!=3||(unsigned)num(o,"request")!=search_request)return;
+        search_pending=false;
+        for(int i=0;i<search_count;i++)free(search_results[i].text);
+        search_count=0;
+        json_object *arr=NULL;
+        if(json_object_object_get_ex(o,"messages",&arr)&&json_object_is_type(arr,json_type_array))
+            for(size_t i=0;i<json_object_array_length(arr)&&search_count<200;i++) {
+                json_object *m=json_object_array_get_idx(arr,i);Message *out=&search_results[search_count++];
+                memset(out,0,sizeof *out);copy(out->id,sizeof out->id,str(m,"id"));copy(out->jid,sizeof out->jid,str(m,"jid"));
+                copy(out->sender,sizeof out->sender,str(m,"sender"));out->text=strdup(str(m,"text"));
+                if(!out->text)out->text=strdup("");
+                out->time=num(m,"time");out->mine=num(m,"mine")!=0;
+            }
+        if(!strcmp(type,"error"))note(str(o,"text"));
+        picker_choice=picker_top=0;picker_filter();return;
+    }
+    if(!strcmp(type,"participants") || (!strcmp(type,"error")&&!strcmp(str(o,"scope"),"participants"))) {
+        if(strcmp(member_jid,str(o,"jid")))return;
+        member_pending=false;member_count=0;
+        copy(member_error,sizeof member_error,!strcmp(type,"error")?str(o,"text"):str(o,"error"));
+        json_object *arr=NULL;
+        if(json_object_object_get_ex(o,"users",&arr)&&json_object_is_type(arr,json_type_array))
+            for(size_t i=0;i<json_object_array_length(arr)&&member_count<2048;i++) {
+                json_object *u=json_object_array_get_idx(arr,i);Member *m=&members[member_count++];
+                copy(m->id,sizeof m->id,str(u,"id"));copy(m->name,sizeof m->name,str(u,"name"));
+            }
+        if(picker==2) {picker_choice=picker_top=0;picker_filter();}return;
     }
     if(!strcmp(type,"status")) {
         bool was_online=online;
@@ -293,7 +348,7 @@ static void event(json_object *o) {
             for(size_t i=0;i<json_object_array_length(arr);i++) add_message(json_object_array_get_idx(arr,i));
     } else if(!strcmp(type,"sent") && (unsigned)num(o,"token")==send_token) {
         awaiting_send=false;
-        if(selected>=0) {chats[selected].draft[0]=0;chats[selected].attachment[0]=0;}
+        if(selected>=0) {chats[selected].draft[0]=0;chats[selected].attachment[0]=0;chats[selected].quote_id[0]=0;chats[selected].mention_count=0;}
         compose_cursor=0; note("Message sent");
     } else if(!strcmp(type,"error")) {
         note(str(o,"text"));
@@ -343,12 +398,64 @@ static void read_bridge(void) {
         note("Connection bridge exited. See ~/.local/state/whatsapp-tui/bridge.log");
     }
 }
-typedef struct { wchar_t text[512]; int style, indent, span, message_index, image_row; bool meta; } Row;
+typedef struct { wchar_t text[512]; unsigned char attributes[512]; int style, indent, span, message_index, image_row; bool meta; } Row;
 static Row *rows; static int row_count;
 #define MAX_ROWS 40000
 static void add_row(const wchar_t *s,int style,bool meta) {
     if(row_count==MAX_ROWS) return;
-    Row *r=&rows[row_count++]; wcsncpy(r->text,s,511); r->text[511]=0; r->style=style; r->meta=meta;r->indent=0;r->span=0;r->message_index=-1;r->image_row=-1;
+    Row *r=&rows[row_count++];memset(r->attributes,0,sizeof r->attributes); wcsncpy(r->text,s,511); r->text[511]=0; r->style=style; r->meta=meta;r->indent=0;r->span=0;r->message_index=-1;r->image_row=-1;
+}
+static void add_styled_row(const wchar_t *text,const unsigned char *attributes,int style) {
+    int before=row_count;add_row(text,style,false);
+    if(row_count>before)memcpy(rows[before].attributes,attributes,wcslen(rows[before].text));
+}
+/* Parse paired WhatsApp markers without splitting UTF-8 code points. */
+static wchar_t *formatted_text(const char *text,unsigned char **attributes) {
+    size_t capacity=strlen(text)+1;
+    wchar_t *wide=calloc(capacity,sizeof *wide);*attributes=calloc(capacity,1);
+    if(!wide||!*attributes) {free(wide);free(*attributes);*attributes=NULL;return NULL;}
+    mbstate_t state={0};size_t length=0;
+    while(*text) {
+        wchar_t wc;size_t n=mbrtowc(&wc,text,MB_CUR_MAX,&state);
+        if(n==(size_t)-1||n==(size_t)-2) {wc=L'?';n=1;memset(&state,0,sizeof state);}
+        if(!n)break;
+        text+=n;wide[length++]=wc;
+    }
+    size_t closes[2]={SIZE_MAX,SIZE_MAX},out=0;unsigned char active=0;
+    for(size_t i=0;i<length;i++) {
+        wchar_t wc=wide[i];int kind=wc==L'*'?0:wc==L'_'?1:-1;
+        if(kind>=0) {
+            unsigned char bit=(unsigned char)(1<<kind);
+            if(closes[kind]==i) {active&=(unsigned char)~bit;closes[kind]=SIZE_MAX;continue;}
+            if(!(active&bit)&&(i==0||iswspace(wide[i-1])||iswpunct(wide[i-1]))&&i+1<length&&!iswspace(wide[i+1])) {
+                for(size_t j=i+2;j<length;j++)if(wide[j]==wc&&!iswspace(wide[j-1])&&(j+1==length||iswspace(wide[j+1])||iswpunct(wide[j+1]))) {
+                    closes[kind]=j;active|=bit;break;
+                }
+                if(closes[kind]!=SIZE_MAX)continue;
+            }
+        }
+        wide[out]=wc;(*attributes)[out++]=active;
+    }
+    wide[out]=0;return wide;
+}
+static void draw_styled_row(int y,int x,int width,const Row *row) {
+    int cells=0;
+    for(int i=0;row->text[i];i++) {
+        wchar_t wc=row->text[i];int w=wcwidth(wc);if(w<0) {wc=L'?';w=1;}
+        if(cells+w>width)break;
+        attr_t attributes=COLOR_PAIR(row->style);
+        if(row->attributes[i]&1)attributes|=A_BOLD;
+#ifdef A_ITALIC
+        if(row->attributes[i]&2)attributes|=A_ITALIC;
+#else
+        if(row->attributes[i]&2)attributes|=A_UNDERLINE;
+#endif
+        wchar_t glyph[CCHARW_MAX]={wc,0};int count=1;
+        while(row->text[i+1]&&wcwidth(row->text[i+1])==0&&count<CCHARW_MAX-1)glyph[count++]=row->text[++i];
+        cchar_t character;
+        if(setcchar(&character,glyph,attributes & ~A_COLOR,(short)row->style,NULL)==OK)mvadd_wch(y,x+cells,&character);
+        cells+=w;
+    }
 }
 static int message_compare(const void *a,const void *b) {
     const Message *ma=*(Message*const*)a,*mb=*(Message*const*)b;
@@ -361,8 +468,8 @@ static void build_rows(int width) {
     Message *ordered[MAX_MESSAGES]; int count=0;
     for(int i=0;i<message_count;i++) if(!strcmp(messages[i].jid,chats[selected].id)) ordered[count++]=&messages[i];
     qsort(ordered,(size_t)count,sizeof ordered[0],message_compare);
-    /* Keep a bounded view of the most recent messages. */
-    int begin=count>400?count-400:0; char last_day[64]="";
+    /* Search can jump to any message in the bounded local history. */
+    int begin=0; char last_day[64]="";
     for(int i=begin;i<count;i++) {
         Message *m=ordered[i]; char date[64]; time_text(m->time,date,sizeof date,"%a, %d %b %Y");
         if(strcmp(date,last_day)) {
@@ -375,6 +482,10 @@ static void build_rows(int width) {
                  m->mine?"  ·  ":"",m->mine?m->status:"");
         wchar_t meta_w[512]; mbstowcs(meta_w,meta,511); meta_w[511]=0;
         add_row(meta_w,m->mine?ACCENT:MUTED,true);
+        if(*m->quote_text) {
+            char quoted[800];snprintf(quoted,sizeof quoted,"↪ %s: %s",m->quote_sender,m->quote_text);
+            wchar_t wide[512]={0};mbstowcs(wide,quoted,511);add_row(wide,MUTED,true);
+        }
         const char *p=m->text;
         if(m->photo && strcmp(graphics,"external")) {
             for(int r=0;r<photo_rows;r++) {
@@ -384,26 +495,27 @@ static void build_rows(int width) {
             p=strchr(m->text,'\n');
             if(p)p++;else {p=strchr(m->text,']');p=p?p+1:"";while(*p==' ')p++;}
         }
-        mbstate_t st={0}; wchar_t line[512]; int len=0,cells=0;
-        while(*p) {
-            wchar_t wc; size_t n=mbrtowc(&wc,p,MB_CUR_MAX,&st);
-            if(n==(size_t)-1||n==(size_t)-2) {wc=L'?';n=1;memset(&st,0,sizeof st);} if(!n) break; p+=n;
-            if(wc==L'\r') continue;
-            if(wc==L'\n') {line[len]=0;add_row(line,m->mine?OUTGOING:BASE,false);len=cells=0;continue;}
-            if(wc<32||(wc>=127&&wc<160)) wc=L' ';
-            int w=wcwidth(wc); if(w<0) {wc=L'?';w=1;}
-            if(cells+w>width || len>=510) {
-                int split=len;
-                for(int j=len-1;j>0;j--) if(line[j]==L' ') {split=j;break;}
-                line[split]=0;add_row(line,m->mine?OUTGOING:BASE,false);
-                int remainder=split<len?len-split-1:0;
-                if(remainder) memmove(line,line+split+1,(size_t)remainder*sizeof *line);
-                len=remainder;cells=0;
-                for(int j=0;j<len;j++) {int cw=wcwidth(line[j]);if(cw>0)cells+=cw;}
+        unsigned char *attributes=NULL;wchar_t *body=formatted_text(p,&attributes);
+        if(body) {
+            wchar_t line[512];unsigned char line_attributes[512]={0};int len=0,cells=0;
+            for(int k=0;body[k];k++) {
+                wchar_t wc=body[k];
+                if(wc==L'\r')continue;
+                if(wc==L'\n') {line[len]=0;add_styled_row(line,line_attributes,m->mine?OUTGOING:BASE);len=cells=0;continue;}
+                if(wc<32||(wc>=127&&wc<160))wc=L' ';
+                int w=wcwidth(wc);if(w<0) {wc=L'?';w=1;}
+                if(cells+w>width||len>=510) {
+                    int split=len;for(int j=len-1;j>0;j--)if(line[j]==L' ') {split=j;break;}
+                    line[split]=0;add_styled_row(line,line_attributes,m->mine?OUTGOING:BASE);
+                    int remainder=split<len?len-split-1:0;
+                    if(remainder) {memmove(line,line+split+1,(size_t)remainder*sizeof *line);memmove(line_attributes,line_attributes+split+1,(size_t)remainder);}
+                    len=remainder;cells=0;for(int j=0;j<len;j++) {int cw=wcwidth(line[j]);if(cw>0)cells+=cw;}
+                }
+                line_attributes[len]=attributes[k];line[len++]=wc;cells+=w;
             }
-            line[len++]=wc;cells+=w;
+            line[len]=0;add_styled_row(line,line_attributes,m->mine?OUTGOING:BASE);
+            free(body);free(attributes);
         }
-        line[len]=0;add_row(line,m->mine?OUTGOING:BASE,false);
         if(m->mine) {
             int span=m->photo&&strcmp(graphics,"external")?photo_columns:24;
             for(int r=first;r<row_count;r++) {
@@ -543,7 +655,7 @@ static void clear_inline_images(void) {
     }
 }
 static void draw_inline_images(void) {
-    if(selected<0||viewer||qr||help||focus==NEW_FOCUS||COLS<64||LINES<22||!strcmp(graphics,"external"))return;
+    if(selected<0||viewer||qr||help||picker||focus==NEW_FOCUS||COLS<64||LINES<22||!strcmp(graphics,"external"))return;
     int sidebar=COLS/3;if(sidebar>38)sidebar=38;if(sidebar<24)sidebar=24;
     int height=LINES-16;
     for(int i=0;i<height&&visible_row_start+i<row_count;i++) {
@@ -658,12 +770,16 @@ static void draw_editor(int x,int width) {
     rule(y,x,width,MUTED);
     bool attached=selected>=0 && *chats[selected].attachment;
     label(y+1,x+2,width-4,awaiting_send?"SENDING…":attached?"PHOTO ATTACHED  ·  Ctrl+X remove  ·  Ctrl+V replace":"MESSAGE",focus==COMPOSE_FOCUS?ACCENT:MUTED,true);
+    if(selected>=0 && *chats[selected].quote_id && !awaiting_send) {
+        char reply[900];snprintf(reply,sizeof reply,"↪ %s · Ctrl+R clear · %s",chats[selected].quote_sender,chats[selected].quote_text);
+        label(y+1,x+2,width-4,reply,ACCENT,true);
+    }
     fill(y+2,x+1,1,width-2,PANEL);
     if(selected<0) {label(y+2,x+3,width-6,"Select a chat to start writing",MUTED,false);return;}
     wchar_t *draft=chats[selected].draft; int start=0,cells=0;
     for(int i=0;i<compose_cursor;i++) cells+=wcwidth(draft[i])>0?wcwidth(draft[i]):0;
     while(cells>width-8 && start<compose_cursor) {int w=wcwidth(draft[start++]); cells-=w>0?w:0;}
-    if(!*draft) label(y+2,x+3,width-6,attached?"Add a caption…":"Write a message…",PANEL_MUTED,false);
+    if(!*draft) label(y+2,x+3,width-6,attached?"Add a caption…":"Message…  # quote  @ mention",PANEL_MUTED,false);
     else wide_label(y+2,x+3,width-6,draft+start,PANEL);
     if(focus==COMPOSE_FOCUS && !help && !awaiting_send) {composer_y=y+2;composer_x=x+3+cells;curs_set(1);move(composer_y,composer_x);}
 }
@@ -709,6 +825,11 @@ static void draw_conversation(int x,int width) {
     else {char number[160];copy(number,sizeof number,c->id);number[strcspn(number,"@")]=0;snprintf(subtitle,sizeof subtitle,"Private conversation  ·  +%s",number);}
     label(6,x+3,width-6,subtitle,MUTED,false); rule(8,x+1,width-2,MUTED);
     int height=LINES-16; build_rows(width-8);
+    if(*jump_id) {
+        for(int i=0;i<row_count;i++)if(rows[i].message_index>=0&&!strcmp(messages[rows[i].message_index].id,jump_id)) {
+            scroll_offset=row_count-i-height/2;if(scroll_offset<0)scroll_offset=0;jump_id[0]=0;break;
+        }
+    }
     int max_scroll=row_count>height?row_count-height:0;
     if(scroll_offset>max_scroll) scroll_offset=max_scroll;
     int start=row_count-height-scroll_offset; if(start<0) start=0;
@@ -723,7 +844,7 @@ static void draw_conversation(int x,int width) {
     for(int i=0;i<height && start+i<row_count;i++) {
         Row *r=&rows[start+i];
         if(r->style==OUTGOING && !r->meta) fill(9+i,x+2+r->indent,1,r->span+4,OUTGOING);
-        wide_label(9+i,x+4+r->indent,width-8-r->indent,r->text,r->style);
+        draw_styled_row(9+i,x+4+r->indent,width-8-r->indent,r);
         if(r->image_row>=0&&r->message_index>=0&&(r->image_row==0||i==0)) {
             int origin=i-r->image_row;
             if(origin<0||origin+photo_rows>height)
@@ -737,12 +858,159 @@ static void draw_conversation(int x,int width) {
     }
     draw_editor(x,width);
 }
+/* Subsequence search rewards contiguous matches and word beginnings. */
+static int fuzzy_score(const char *text,const wchar_t *needle) {
+    if(!*needle)return 0;
+    mbstate_t state={0};int score=0,previous=-2,index=0,q=0;wchar_t before=L' ';
+    while(*text) {
+        wchar_t wc;size_t n=mbrtowc(&wc,text,MB_CUR_MAX,&state);
+        if(n==(size_t)-1||n==(size_t)-2) {n=1;wc=L'?';memset(&state,0,sizeof state);}
+        if(!n)break;
+        text+=n;
+        if(towlower(wc)==towlower(needle[q])) {
+            score+=10+(previous==index-1?20:0)+(iswspace(before)||iswpunct(before)?15:0);
+            if(previous<0)score-=index<50?index:50;
+            previous=index;if(!needle[++q])return score;
+        }
+        before=wc;index++;
+    }
+    return INT_MIN;
+}
+static void picker_filter(void) {
+    picker_count=0;if(!picker||(picker!=3&&selected<0))return;
+    if(picker==3&&!demo) {picker_count=search_count;for(int i=0;i<search_count;i++)picker_items[i]=i;return;}
+    int total=picker==2?member_count:message_count;
+    for(int i=total-1;i>=0;i--) {
+        char text[2048];
+        if(picker!=2) {
+            Message *m=&messages[i];if(picker==1&&strcmp(m->jid,chats[selected].id))continue;
+            Chat *c=find_chat(m->jid,false);
+            snprintf(text,sizeof text,"%s %s %s",picker==3&&c?c->name:"",m->mine?"You":m->sender,m->text);
+        } else snprintf(text,sizeof text,"%s %s",members[i].name,members[i].id);
+        int score=fuzzy_score(text,picker_query);
+        if(picker!=2) {int body_score=fuzzy_score(messages[i].text,picker_query);if(body_score>score)score=body_score;}
+        if(score==INT_MIN)continue;
+        if(!*picker_query && picker!=2)score=(int)(messages[i].time/60);
+        int j=picker_count++;
+        while(j>0&&picker_scores[j-1]<score) {
+            picker_items[j]=picker_items[j-1];picker_scores[j]=picker_scores[j-1];j--;
+        }
+        picker_items[j]=i;picker_scores[j]=score;
+    }
+    if(picker_choice>=picker_count)picker_choice=picker_count?picker_count-1:0;
+}
+static void search_history(void) {
+    if(demo) {picker_filter();return;}
+    for(int i=0;i<search_count;i++)free(search_results[i].text);
+    search_count=0;picker_count=0;search_pending=true;
+    char text[512];const wchar_t *p=picker_query;mbstate_t state={0};
+    size_t n=wcsrtombs(text,&p,sizeof text-1,&state);if(n==(size_t)-1)return;text[n]=0;
+    json_object *o=json_object_new_object();
+    json_object_object_add(o,"type",json_object_new_string("search-history"));
+    json_object_object_add(o,"query",json_object_new_string(text));
+    json_object_object_add(o,"request",json_object_new_int64(++search_request));
+    if(!command(o)) {search_pending=false;note("Connection bridge unavailable");}
+    json_object_put(o);
+}
+static void begin_picker(int type) {
+    picker=type;picker_query[0]=0;picker_cursor=picker_choice=picker_top=0;
+    if(type==2) {
+        member_count=0;member_pending=!demo;member_error[0]=0;
+        copy(member_jid,sizeof member_jid,chats[selected].id);
+        if(demo) {
+            copy(members[0].id,sizeof members[0].id,"15550101001@s.whatsapp.net");
+            copy(members[0].name,sizeof members[0].name,"Alex Morgan");
+            copy(members[1].id,sizeof members[1].id,"15550101002@s.whatsapp.net");
+            copy(members[1].name,sizeof members[1].name,"Sam Rivera");member_count=2;
+        } else {
+            json_object *o=json_object_new_object();
+            json_object_object_add(o,"type",json_object_new_string("participants"));
+            json_object_object_add(o,"jid",json_object_new_string(member_jid));
+            if(!command(o)) {member_pending=false;copy(member_error,sizeof member_error,"Connection bridge unavailable");}
+            json_object_put(o);
+        }
+    }
+    if(type==3)search_history();
+    picker_filter();
+}
+/* Editing inside a mention removes its metadata; edits outside move its range. */
+static bool compose_splice(int start,int removed,const wchar_t *insert) {
+    Chat *c=&chats[selected];int len=(int)wcslen(c->draft),added=(int)wcslen(insert);
+    if(start<0||removed<0||start+removed>len||len-removed+added>=EDIT_SIZE)return false;
+    for(int i=0;i<c->mention_count;) {
+        Mention *m=&c->mentions[i];
+        bool overlap=removed?start<m->end&&start+removed>m->start:start>m->start&&start<m->end;
+        if(overlap) {memmove(m,m+1,(size_t)(--c->mention_count-i)*sizeof *m);continue;}
+        if(m->start>=start+removed) {m->start+=added-removed;m->end+=added-removed;}
+        i++;
+    }
+    memmove(c->draft+start+added,c->draft+start+removed,(size_t)(len-start-removed+1)*sizeof(wchar_t));
+    wmemcpy(c->draft+start,insert,(size_t)added);compose_cursor=start+added;return true;
+}
+static void choose_picker(void) {
+    if(!picker_count)return;
+    int index=picker_items[picker_choice];
+    if(picker==3) {
+        Message *m=demo?&messages[index]:&search_results[index];Chat *target=find_chat(m->jid,true);
+        if(!target)return;
+        selected=(int)(target-chats);query[0]=0;focus=CHAT_FOCUS;picker=0;
+        history_request();copy(jump_id,sizeof jump_id,m->id);note("Jumped to search result");return;
+    }
+    Chat *c=&chats[selected];
+    if(picker==1) {
+        Message *m=&messages[index];copy(c->quote_id,sizeof c->quote_id,m->id);
+        copy(c->quote_sender,sizeof c->quote_sender,m->mine?"You":*m->sender?m->sender:c->name);
+        copy(c->quote_text,sizeof c->quote_text,m->text);note("Reply selected. Ctrl+R clears it.");
+    } else {
+        if(c->mention_count==32) {note("A message supports up to 32 mentions.");return;}
+        wchar_t token[260]={L'@',0};mbstowcs(token+1,members[index].name,255);
+        for(int i=1;token[i];i++)if(!iswprint(token[i]))token[i]=L' ';
+        int length=(int)wcslen(token);token[length]=L' ';token[length+1]=0;
+        int start=compose_cursor;if(!compose_splice(start,0,token)) {note("Your draft is full.");return;}
+        Mention *m=&c->mentions[c->mention_count++];copy(m->id,sizeof m->id,members[index].id);
+        m->start=start;m->end=start+length;note("User tagged");
+    }
+    picker=0;
+}
+static void draw_picker(void) {
+    picker_filter();
+    int width=COLS>100?76:COLS-8,x=(COLS-width)/2,slots=(LINES-12)/2;
+    if(slots>6)slots=6;
+    if(slots<1)slots=1;
+    int height=slots*2+6,y=LINES-7-height;if(y<2)y=2;
+    fill(y,x,height,width,PANEL);
+    label(y+1,x+2,width-4,picker==1?"QUOTE A MESSAGE":picker==2?"TAG A USER":"SEARCH ALL CHAT HISTORY",PANEL_ACCENT,true);
+    fill(y+2,x+2,1,width-4,SELECTED);
+    if(*picker_query)wide_label(y+2,x+3,width-6,picker_query,SELECTED);
+    else label(y+2,x+3,width-6,"Type to fuzzy search…",SELECTED_MUTED,false);
+    if(picker_choice<picker_top)picker_top=picker_choice;
+    if(picker_choice>=picker_top+slots)picker_top=picker_choice-slots+1;
+    for(int i=0;i<slots&&picker_top+i<picker_count;i++) {
+        int item=picker_items[picker_top+i],style=picker_choice==picker_top+i?SELECTED:PANEL;
+        int muted=style==SELECTED?SELECTED_MUTED:PANEL_MUTED;
+        fill(y+3+i*2,x+2,2,width-4,style);
+        if(picker!=2) {
+            Message *m=picker==3&&!demo?&search_results[item]:&messages[item];char heading[640],stamp[32];time_text(m->time,stamp,sizeof stamp,"%d %b · %H:%M");
+            Chat *chat=find_chat(m->jid,false);
+            snprintf(heading,sizeof heading,"%s%s%s · %s",picker==3&&chat?chat->name:"",picker==3?" · ":"",m->mine?"You":*m->sender?m->sender:chat?chat->name:m->jid,stamp);
+            label(y+3+i*2,x+3,width-6,heading,style,true);
+            label(y+4+i*2,x+3,width-6,m->text,muted,false);
+        } else {
+            label(y+3+i*2,x+3,width-6,members[item].name,style,true);
+            label(y+4+i*2,x+3,width-6,members[item].id,muted,false);
+        }
+    }
+    if(!picker_count)label(y+4,x+3,width-6,search_pending&&picker==3?"Searching synced history…":member_pending&&picker==2?"Loading chat members…":picker==2&&*member_error?member_error:"No matches",PANEL_MUTED,false);
+    label(y+height-2,x+3,width-6,"↑ ↓ choose  ·  Enter select  ·  Esc cancel",PANEL_MUTED,false);
+    curs_set(1);int cells=0;for(int i=0;i<picker_cursor;i++) {int w=wcwidth(picker_query[i]);if(w>0)cells+=w;}
+    move(y+2,x+3+(cells<width-6?cells:width-7));
+}
 static void modal(void) {
     int width=COLS>90?66:COLS-8,x=(COLS-width)/2,y=LINES/2-5;
     fill(y,x,10,width,PANEL);
     label(y+1,x+3,width-6,help?"KEYBOARD":"NEW CONVERSATION",PANEL_ACCENT,true);
     if(help) {
-        const char *lines[]={"Tab             Switch chats / message","↑ ↓ or j k      Select a chat","/               Search chats","Enter           Compose / send message","V               View photos; ← / → browse","Ctrl+V / Ctrl+X Paste / remove image","Ctrl+N          New chat  ·  PgUp/Dn scroll","Esc             Close  ·  Ctrl+Q quit"};
+        const char *lines[]={"Tab             Switch chats / message","↑ ↓ or j k      Select a chat","/ fuzzy chats   Ctrl+F all chat history","# quote  @ tag  · Enter compose / send","V               View photos; ← / → browse","Ctrl+V / Ctrl+X Paste / remove image","Ctrl+R clear reply · Ctrl+N new chat","Esc             Close  ·  Ctrl+Q quit"};
         for(int i=0;i<8;i++) label(y+2+i,x+3,width-6,lines[i],PANEL,false);
     } else {
         label(y+3,x+3,width-6,"International phone number, including country code",PANEL,false);
@@ -765,8 +1033,9 @@ static void draw(void) {
     }
     fill(LINES-2,0,2,COLS,PANEL);
     label(LINES-2,2,COLS-4,notice,PANEL_MUTED,false);
-    label(LINES-1,2,COLS-4,"Tab switch   / search   V photos   Ctrl+V image   F1 help   Ctrl+Q quit",PANEL_MUTED,false);
-    if(help || focus==NEW_FOCUS) {curs_set(0);modal();}
+    label(LINES-1,2,COLS-4,"Tab switch   Ctrl+F history   # quote   @ tag   Ctrl+V image   F1 help",PANEL_MUTED,false);
+    if(picker && COLS>=64 && LINES>=22)draw_picker();
+    else if(help || focus==NEW_FOCUS) {curs_set(0);modal();}
     else if(focus==COMPOSE_FOCUS&&selected>=0&&!awaiting_send&&!qr&&COLS>=64&&LINES>=22)move(composer_y,composer_x);
     refresh();
     draw_inline_images();
@@ -782,13 +1051,27 @@ static void send_message(void) {
     for(int i=0;draft[i];i++) if(!iswspace(draft[i])) content=true;
     bool attached=*chats[selected].attachment!=0;
     if(!content && !attached) return;
-    char text[EDIT_SIZE*4+1]; const wchar_t *p=draft; mbstate_t st={0};
-    size_t n=wcsrtombs(text,&p,sizeof text-1,&st); if(n==(size_t)-1) return; text[n]=0;
+    wchar_t outgoing[EDIT_SIZE*8+1];int out=0;
+    json_object *mentions=json_object_new_array();
+    for(int i=0;draft[i];) {
+        Mention *mention=NULL;
+        for(int j=0;j<chats[selected].mention_count;j++)if(chats[selected].mentions[j].start==i)mention=&chats[selected].mentions[j];
+        if(mention) {
+            outgoing[out++]=L'@';
+            for(int j=0;mention->id[j]&&mention->id[j]!='@';j++)outgoing[out++]=(unsigned char)mention->id[j];
+            json_object_array_add(mentions,json_object_new_string(mention->id));i=mention->end;
+        } else outgoing[out++]=draft[i++];
+    }
+    outgoing[out]=0;
+    char text[EDIT_SIZE*32+1]; const wchar_t *p=outgoing; mbstate_t st={0};
+    size_t n=wcsrtombs(text,&p,sizeof text-1,&st); if(n==(size_t)-1) {json_object_put(mentions);return;} text[n]=0;
     json_object *o=json_object_new_object();
     json_object_object_add(o,"type",json_object_new_string(attached?"send-image":"send"));
     if(attached)json_object_object_add(o,"path",json_object_new_string(chats[selected].attachment));
     json_object_object_add(o,"jid",json_object_new_string(chats[selected].id));
     json_object_object_add(o,"text",json_object_new_string(text));
+    json_object_object_add(o,"mentions",mentions);
+    if(*chats[selected].quote_id)json_object_object_add(o,"quote",json_object_new_string(chats[selected].quote_id));
     json_object_object_add(o,"token",json_object_new_int64(++send_token));
     if(command(o)) {awaiting_send=true;note("Sending…");} json_object_put(o);
 }
@@ -816,13 +1099,23 @@ static void edit_key(wchar_t *buf,int capacity,int *cursor,wint_t key,bool speci
         memmove(buf+*cursor+1,buf+*cursor,(size_t)(len-*cursor+1)*sizeof *buf);buf[(*cursor)++]=(wchar_t)key;
     }
 }
+static void compose_edit(wint_t key,bool special) {
+    int len=(int)wcslen(chats[selected].draft);
+    if((special&&key==KEY_BACKSPACE)||(!special&&(key==127||key==8))) {
+        if(compose_cursor>0)compose_splice(compose_cursor-1,1,L"");
+    } else if(special&&key==KEY_DC) {
+        if(compose_cursor<len)compose_splice(compose_cursor,1,L"");
+    } else if(!special&&key==21)compose_splice(0,len,L"");
+    else if(!special&&iswprint(key)) {wchar_t insert[2]={(wchar_t)key,0};compose_splice(compose_cursor,0,insert);}
+    else edit_key(chats[selected].draft,EDIT_SIZE,&compose_cursor,key,special);
+}
 static void keypress(wint_t key,bool special) {
-    if(special && key==PASTE_START) {pasting=true;return;}
+    if(special && key==PASTE_START) {picker=0;pasting=true;return;}
     if(special && key==PASTE_END) {pasting=false;return;}
     if(pasting) {
         if(!awaiting_send && focus==COMPOSE_FOCUS && selected>=0 && !special) {
             if(key==L'\n'||key==L'\r'||key==L'\t')key=L' ';
-            if(iswprint(key))edit_key(chats[selected].draft,EDIT_SIZE,&compose_cursor,key,false);
+            if(iswprint(key))compose_edit(key,false);
         }
         return;
     }
@@ -849,6 +1142,20 @@ static void keypress(wint_t key,bool special) {
     if(help) {if(!special&&key==27)help=false;return;}
     if(special&&key==KEY_RESIZE) return;
     if(awaiting_send) return;
+    if(picker) {
+        if(!special&&key==27) {picker=0;return;}
+        if(key==L'\n'||(special&&key==KEY_ENTER)) {choose_picker();return;}
+        if(special&&(key==KEY_UP||key==KEY_DOWN)) {
+            picker_choice+=key==KEY_UP?-1:1;
+            if(picker_choice<0)picker_choice=0;
+            if(picker_choice>=picker_count)picker_choice=picker_count?picker_count-1:0;
+            return;
+        }
+        if(special&&key==KEY_MOUSE)return;
+        edit_key(picker_query,128,&picker_cursor,key,special);picker_choice=picker_top=0;if(picker==3)search_history();picker_filter();return;
+    }
+    if(!special&&key==6&&!qr) {begin_picker(3);return;}
+    if(!special&&key==18&&selected>=0) {chats[selected].quote_id[0]=0;note("Reply cleared");return;}
     if(focus==NEW_FOCUS) {
         if(!special&&key==27) {focus=CHAT_FOCUS;return;}
         if(key==L'\n'||(special&&key==KEY_ENTER)) {new_chat();return;}
@@ -897,7 +1204,12 @@ static void keypress(wint_t key,bool special) {
     }
     if(focus==COMPOSE_FOCUS) {
         if(key==L'\n'||(special&&key==KEY_ENTER)) {send_message();return;}
-        if(selected>=0) edit_key(chats[selected].draft,EDIT_SIZE,&compose_cursor,key,special);
+        if(selected>=0) {
+            if(!special&&(key==L'#'||(key==L'@'&&(compose_cursor==0||iswspace(chats[selected].draft[compose_cursor-1]))))) {
+                begin_picker(key==L'#'?1:2);return;
+            }
+            compose_edit(key,special);
+        }
         return;
     }
     if(!special&&key==L'/') {query[0]=0;focus=SEARCH_FOCUS;return;}
@@ -996,7 +1308,7 @@ int main(int argc,char **argv) {
         if(!strcmp(argv[i],"--demo")) demo=true;
         else if(!strcmp(argv[i],"--reset-session")) reset=true;
         else if(!strcmp(argv[i],"--help")) {
-            puts("WhatsApp TUI · C interface with live Omarchy colors\n\nUsage: whatsapp-tui [--demo | --reset-session]\n\n--demo           Preview without a WhatsApp connection\n--reset-session  Confirm removal of local pairing and cached history/media\n\nTab: focus  /: search  Enter: compose/send  Ctrl+N: new chat\nV: view photos  Ctrl+V: attach clipboard image  Ctrl+X: remove image\nPhoto viewer: arrows browse  O external viewer  Esc close\nPgUp/PgDn: scroll  F1: help  Ctrl+Q: quit\n\nPalette: $XDG_STATE_HOME/omarchy/current/theme/colors.toml\nSession: $XDG_STATE_HOME/whatsapp-tui (default ~/.local/state)\nImages: Foot (Sixel), Kitty/Ghostty (Kitty graphics), otherwise external viewer\nWHATSAPP_TUI_GRAPHICS=sixel|kitty|external overrides image detection");return 0;
+            puts("WhatsApp TUI · C interface with live Omarchy colors\n\nUsage: whatsapp-tui [--demo | --reset-session]\n\n--demo           Preview without a WhatsApp connection\n--reset-session  Confirm removal of local pairing and cached history/media\n\nTab: focus  /: search  Enter: compose/send  Ctrl+N: new chat\nV: view photos  Ctrl+V: attach clipboard image  Ctrl+X: remove image\nPhoto viewer: arrows browse  O external viewer  Esc close\n#: quote message  @: tag user  Ctrl+R: clear reply\nCtrl+F: fuzzy search all synced chat history\nPgUp/PgDn: scroll  F1: help  Ctrl+Q: quit\n\nPalette: $XDG_STATE_HOME/omarchy/current/theme/colors.toml\nSession: $XDG_STATE_HOME/whatsapp-tui (default ~/.local/state)\nImages: Foot (Sixel), Kitty/Ghostty (Kitty graphics), otherwise external viewer\nWHATSAPP_TUI_GRAPHICS=sixel|kitty|external overrides image detection");return 0;
         } else {fprintf(stderr,"Unknown option: %s\n",argv[i]);return 1;}
     }
     if(!paths())return 1;
@@ -1041,6 +1353,7 @@ int main(int argc,char **argv) {
     if(child>0) {kill(child,SIGTERM);waitpid(child,NULL,0);}
     if(qr)QRcode_free(qr);
     for(int i=0;i<message_count;i++)free(messages[i].text);
+    for(int i=0;i<search_count;i++)free(search_results[i].text);
     for(int i=0;i<THUMB_CACHE;i++)free(thumbnails[i].data);
     if(session_lock>=0)close(session_lock);
     free(rows);free(wire);free(image_data);return 0;

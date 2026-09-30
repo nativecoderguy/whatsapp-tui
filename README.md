@@ -32,7 +32,11 @@ Find **WhatsApp TUI** in the desktop application launcher.
 | --- | --- |
 | Tab | Switch between chat list and composer |
 | ↑ / ↓, j / k | Select a chat while the chat list has focus |
-| / | Search conversations; Enter selects the first match |
+| / | Fuzzy search conversation names and numbers; Enter selects the best match |
+| Ctrl+F | Fuzzy search messages across all locally synced chats; Enter jumps to a result |
+| # | In the composer, fuzzy search this chat's messages and select a reply |
+| @ | At the start of a word in the composer, search and tag a chat member |
+| Ctrl+R | Clear the selected reply while keeping the draft |
 | Enter | Focus composer, or send when composing |
 | Esc | Return to chat list / close a dialog |
 | Ctrl+N | Open a chat by international phone number |
@@ -43,6 +47,32 @@ Find **WhatsApp TUI** in the desktop application launcher.
 | Ctrl+X | Remove the attached photo, keeping its caption |
 | F1 | Show help |
 | Ctrl+Q | Quit |
+
+## Replies, mentions, and formatting
+
+Type **#** while composing to open a message picker. Search by sender or message
+text, choose with **↑ / ↓**, then press **Enter**. The composer shows the selected
+reply; your next **Enter** sends a native WhatsApp reply. **Ctrl+R** removes the
+reply. **Esc** cancels a picker without changing your draft. Replies also work
+with photo captions and appear inline when received.
+
+Type **@** at the start of a word to find a user. Groups load their member list
+from WhatsApp; direct conversations show the contact and your own account.
+Offline groups can show members known from cached messages. A selected mention
+appears as `@Name` in the composer and sends the corresponding WhatsApp user ID
+and mention metadata. Editing inside a mention converts it back to ordinary text.
+Drafts, replies, and mentions stay intact if sending fails.
+
+**Ctrl+F** searches the complete local history cache, including conversations
+you have not opened in this session. Search is case insensitive and matches
+characters in order, so `mtg` can find `meeting`. Results show the conversation,
+sender, time, and message text. The best 200 matches are shown. History is limited
+to what WhatsApp has synced and the newest 500 cached messages per conversation.
+
+Write `*bold*`, `_italic_`, or `*_bold italic_*` for WhatsApp formatting. The chat
+renders these styles across wrapped lines while preserving UTF-8 accented text,
+emoji, and existing Unicode styled letters. Actual italic appearance depends on
+the terminal and font. Literal unmatched markers remain visible.
 
 Mouse clicks select chats and focus the composer. The wheel scrolls the
 conversation. Drafts are kept per chat during the running session. Failed sends
@@ -142,8 +172,8 @@ Other media appear as labels; video, audio, calls, reactions, and editing are
 not implemented. Downloaded photos and their metadata are in `media/`, and staged
 clipboard images are in `attachments/` inside the local state directory. Resetting
 the session clears these directories as well as pairing and chat history.
-The bridge keeps the newest 500 messages per chat; the UI displays up to 400
-messages from the selected chat and retains up to 20,000 messages in memory.
+The bridge keeps the newest 500 messages per chat; the UI retains up to 20,000
+messages in memory. History search runs against the bridge's complete cache.
 Closing the app keeps its device linked. To unlink remotely, use Linked devices
 on your phone. `whatsapp-tui --reset-session` asks you to type `RESET`, then removes
 this app's local credentials and history so you can pair again.

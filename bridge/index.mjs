@@ -1,10 +1,14 @@
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers,
-  fetchLatestBaileysVersion, normalizeMessageContent, downloadMediaMessage, BufferJSON } from '@whiskeysockets/baileys';
+  fetchLatestBaileysVersion, normalizeMessageContent, downloadMediaMessage, BufferJSON, jidNormalizedUser } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import {mediaDir, mediaKey, clipboardImage, renderImage, attachmentPath, discardAttachment, photoContent, limit} from './media.mjs';
+
+import {composeOptions} from './compose.mjs';
+import {searchHistory} from './search.mjs';
+let searchTimer;
 
 process.umask(0o077);
 const dir = path.join(process.env.XDG_STATE_HOME || path.join(process.env.HOME, '.local/state'), 'whatsapp-tui');
@@ -20,7 +24,7 @@ let thumbnailJob=Promise.resolve();
 const imageDownloads=new Map();
 const cache = path.join(dir, 'history.json');
 try {
-  const saved = JSON.parse(fs.readFileSync(cache, 'utf8'));
+  const saved = JSON.parse(fs.readFileSync(cache, 'utf8'), BufferJSON.reviver);
   for (const chat of saved.chats || []) chats.set(chat.id, chat);
   for (const [jid, list] of Object.entries(saved.messages || {})) messages.set(jid, list);
 } catch { /* First start or interrupted cache write. */ }
@@ -29,12 +33,13 @@ function save() {
   saveTimer = setTimeout(() => {
     try {
       const tmp = cache + '.tmp';
-      fs.writeFileSync(tmp, JSON.stringify({ chats: [...chats.values()], messages: Object.fromEntries(messages) }), { mode: 0o600 });
+      fs.writeFileSync(tmp, JSON.stringify({ chats: [...chats.values()], messages: Object.fromEntries(messages) }, BufferJSON.replacer), { mode: 0o600 });
       fs.renameSync(tmp, cache);
     } catch { emit({ type: 'error', text: 'Could not save local chat history.' }); }
   }, 700);
 }
 function validJid(id) { return typeof id === 'string' && /@(s\.whatsapp\.net|g\.us|lid)$/.test(id); }
+function publicMessage({raw, ...message}) { return message; }
 function chatEvent(chat) { emit({ type: 'chat', ...chat }); }
 function updateChat(raw) {
   if (!validJid(raw.id)) return;
@@ -48,6 +53,8 @@ function updateContact(contact) {
   const name = contact.name || contact.notify;
   if (!validJid(contact.id) || !name) return;
   contactNames.set(contact.id, name);
+  if(contact.lid) contactNames.set(contact.lid,name);
+  if(contact.phoneNumber) contactNames.set(contact.phoneNumber,name);
   if (chats.has(contact.id)) updateChat({id:contact.id, name});
 }
 function unpack(raw, notify = false) {
@@ -77,11 +84,19 @@ function unpack(raw, notify = false) {
   }
   if (content.imageMessage && !photo) body='[View once photo · open on your phone]';
   if(existing) {
-    if(photo && !existing.photo) {existing.photo=true;existing.text=body;emit({type:'message',...existing});save();}
+    existing.raw=raw; existing.senderJid=raw.key.participant || jid;
+    save();
+    if(photo && !existing.photo) {existing.photo=true;existing.text=body;emit({type:'message',...publicMessage(existing)});save();}
     return;
   }
-  const msg = { id: raw.key.id, jid, text: body, mine: !!raw.key.fromMe, photo,
-    sender: raw.pushName || raw.key.participant?.split('@')[0] || '', time: Number(raw.messageTimestamp || Date.now()/1000),
+  const context = Object.values(content).find(value => value?.contextInfo)?.contextInfo;
+  const quoted = normalizeMessageContent(context?.quotedMessage);
+  const quoteText = quoted?.conversation || quoted?.extendedTextMessage?.text || quoted?.imageMessage?.caption || (quoted?.imageMessage ? '[Photo]' : context?.stanzaId ? '[Message]' : '');
+  const senderJid = raw.key.participant || (raw.key.fromMe ? jidNormalizedUser(socket?.user?.id || '') : jid);
+  const msg = { id: raw.key.id, jid, raw, senderJid, quoteText,
+    quoteSender: contactNames.get(context?.participant) || context?.participant?.split('@')[0] || '',
+    text: body, mine: !!raw.key.fromMe, photo,
+    sender: contactNames.get(senderJid) || raw.pushName || raw.key.participant?.split('@')[0] || '', time: Number(raw.messageTimestamp || Date.now()/1000),
     status: raw.key.fromMe ? 'sent' : '' };
   list.push(msg); list.sort((a,b) => a.time-b.time);
   messages.set(jid, list.slice(-500));
@@ -89,9 +104,32 @@ function unpack(raw, notify = false) {
   if (msg.time >= old.time) { old.time = msg.time; old.preview = body; }
   if (notify && !msg.mine) old.unread++;
   chats.set(jid, old); chatEvent(old);
-  emit({ type: 'message', ...msg }); save();
+  emit({ type: 'message', ...publicMessage(msg) }); save();
 }
-function showHistory(jid) { emit({ type: 'history', jid, messages: messages.get(jid) || [] }); }
+function showHistory(jid) { emit({ type: 'history', jid, messages: (messages.get(jid) || []).map(publicMessage) }); }
+async function participants(jid) {
+  if(!validJid(jid)) throw Error('Invalid chat');
+  const users=new Map();
+  const add=(id,name) => {
+    if(!id || !validJid(id) || id.endsWith('@g.us'))return;
+    id=jidNormalizedUser(id);
+    users.set(id,{id,name:contactNames.get(id) || name || id.split('@')[0]});
+  };
+  let error='';
+  if(jid.endsWith('@g.us')) {
+    if(connected) {
+      try {
+        const metadata=await Promise.race([socket.groupMetadata(jid),new Promise((_,reject)=> {
+          const timer=setTimeout(()=>reject(Error('Member lookup timed out')),10000);timer.unref();
+        })]);
+        for(const user of metadata.participants) add(user.id,user.name || user.notify || contactNames.get(user.phoneNumber));
+      } catch(err) {error=err.message;}
+    } else error='Offline: showing members from cached messages';
+    if(!users.size)for(const message of messages.get(jid) || [])add(message.senderJid,message.sender);
+  } else add(jid,chats.get(jid)?.name);
+  add(socket?.user?.id,socket?.user?.name || 'You');
+  emit({type:'participants',jid,users:[...users.values()].sort((a,b)=>a.name.localeCompare(b.name)),error});
+}
 const { state, saveCreds } = await useMultiFileAuthState(path.join(dir, 'auth'));
 let version;
 try { ({ version } = await fetchLatestBaileysVersion({ signal: AbortSignal.timeout(15000) })); }
@@ -140,7 +178,7 @@ async function connect() {
       const msg = messages.get(key.remoteJid)?.find(m => m.id === key.id);
       if (msg && update.status != null) {
         msg.status = update.status >= 4 ? 'read' : update.status >= 3 ? 'delivered' : 'sent';
-        emit({type:'message', ...msg}); save();
+        emit({type:'message', ...publicMessage(msg)}); save();
       }
     }
   });
@@ -181,6 +219,13 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
   let command;
   try {
     command = JSON.parse(line);
+    if(command.type==='search-history') {
+      clearTimeout(searchTimer);
+      if(typeof command.query!=='string'||command.query.length>512)throw Error('Invalid search');
+      searchTimer=setTimeout(()=>emit({type:'search-results',request:command.request,
+        messages:searchHistory(messages,chats,command.query).map(publicMessage)}),120);
+    }
+    if (command.type === 'participants') await participants(command.jid);
     if (command.type === 'history' && validJid(command.jid)) showHistory(command.jid);
     if (command.type === 'clipboard') {
       if(!validJid(command.jid)) throw Error('Select a chat before attaching a photo');
@@ -216,7 +261,12 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
       if (!validJid(command.jid) || typeof command.text !== 'string' || (!image && !command.text.trim()) || command.text.length > 4096) throw Error('Invalid message');
       const file=image?attachmentPath(command.path):undefined;
       const payload=image?await photoContent(file,command.text):{text:command.text};
-      const sent = await socket.sendMessage(command.jid,payload);
+      const {mentions,options}=composeOptions(command,messages.get(command.jid) || [],m => {
+        const file=path.join(mediaDir,mediaKey(m.jid,m.id)+'.json');
+        return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file,'utf8'),BufferJSON.reviver) : undefined;
+      });
+      if(mentions.length)payload.mentions=mentions;
+      const sent = await socket.sendMessage(command.jid,payload,options);
       if (!sent) throw Error('WhatsApp did not accept the message');
       if(image) {
         try {fs.copyFileSync(file,path.join(mediaDir,mediaKey(command.jid,sent.key.id)+'.image'));}
@@ -226,7 +276,7 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
       emit({type:'sent', token:command.token});
       if(image) { try {discardAttachment(file);} catch {} }
     }
-  } catch (err) { emit({ type: 'error', text: err.message, token:command?.token,request:command?.request,scope:command?.type==='thumbnail'?'inline':undefined }); }
+  } catch (err) { emit({ type: 'error', text: err.message, token:command?.token,request:command?.request,scope:command?.type==='thumbnail'?'inline':command?.type==='participants'?'participants':command?.type==='search-history'?'search':undefined,jid:command?.jid }); }
 });
 function stop() { stopping = true; clearTimeout(reconnectTimer); socket?.end(undefined); process.exit(0); }
 process.on('SIGTERM', stop); process.on('SIGINT', stop);
