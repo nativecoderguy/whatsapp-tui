@@ -1,0 +1,7 @@
+/build/
+/bridge/node_modules/
+/bridge/auth/
+/auth_info_baileys/
+/.env
+/bridge/.env
+*.log

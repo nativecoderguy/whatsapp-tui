@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+if command -v foot >/dev/null 2>&1; then
+    exec foot --app-id=whatsapp-tui --title='WhatsApp TUI' --window-size-chars=120x46 "$HOME/.local/bin/whatsapp-tui" "$@"
+elif command -v ghostty >/dev/null 2>&1; then
+    exec ghostty --title='WhatsApp TUI' -e "$HOME/.local/bin/whatsapp-tui" "$@"
+elif command -v alacritty >/dev/null 2>&1; then
+    exec alacritty --title='WhatsApp TUI' -e "$HOME/.local/bin/whatsapp-tui" "$@"
+else
+    printf '%s\n' 'Open a terminal and run whatsapp-tui.' >&2
+    exit 1
+fi

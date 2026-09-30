@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "osman.whatsapp-tui",
+  "name": "WhatsApp TUI",
+  "version": "0.1.0",
+  "author": "WhatsApp TUI contributors",
+  "description": "Launch WhatsApp TUI from the Omarchy bar",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "WhatsApp",
+    "description": "Open WhatsApp TUI in a themed terminal",
+    "category": "Communication",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
